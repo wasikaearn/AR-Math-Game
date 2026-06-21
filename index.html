@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AR Math Game - Hand Tracking</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a202c; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #gameCanvas { display: block; position: absolute; top: 0; left: 0; z-index: 10; }
+        .ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 20; pointer-events: none; }
+        /* เอฟเฟกต์เงาให้ข้อความอ่านง่ายขึ้นเมื่อทับบนภาพกล้อง */
+        .text-shadow { text-shadow: 2px 2px 8px rgba(0, 0, 0, 0.8), -2px -2px 8px rgba(0,0,0,0.8); }
+    </style>
+</head>
+<body>
+
+    <div id="startScreen" class="absolute inset-0 z-50 bg-gray-900 flex flex-col items-center justify-center text-white pointer-events-auto">
+        <h1 class="text-5xl md:text-7xl font-bold mb-6 text-blue-400">AR Math Game</h1>
+        <p class="text-xl mb-8 text-gray-300 max-w-lg text-center leading-relaxed">
+            ใช้ <span class="text-white font-bold">"นิ้วชี้"</span> ของคุณควบคุมเคอร์เซอร์เพื่อเลือกเครื่องหมาย <br><br>
+            <span class="text-orange-400 font-bold text-3xl mx-2">&gt;</span> , 
+            <span class="text-green-400 font-bold text-3xl mx-2">&lt;</span> , 
+            <span class="text-blue-400 font-bold text-3xl mx-2">=</span> <br><br>
+            ที่ถูกต้องที่สุด
+        </p>
+        <button id="startBtn" class="px-8 py-4 bg-blue-600 hover:bg-blue-500 rounded-full text-2xl font-bold transition shadow-lg shadow-blue-500/50">
+            เริ่มเกม
+        </button>
+    </div>
+
+    <video id="webcam" class="hidden" autoplay playsinline></video>
+    
+    <canvas id="gameCanvas"></canvas>
+
+    <div id="ui" class="ui-layer flex flex-col items-center justify-between py-10 opacity-0 transition-opacity duration-1000">
+        <div class="text-3xl md:text-4xl font-bold text-white text-shadow bg-black/30 px-6 py-2 rounded-full">
+            Score: <span id="scoreDisplay" class="text-yellow-400">0</span>
+        </div>
+
+        <div class="text-7xl md:text-9xl font-bold text-white text-shadow tracking-widest mt-10">
+            <span id="num1">00</span> <span class="text-gray-400 mx-4">......</span> <span id="num2">00</span>
+        </div>
+        
+        <div class="mt-auto mb-10 text-xl font-medium text-white text-shadow bg-black/40 px-6 py-3 rounded-full">
+            เลื่อนนิ้วชี้ไปค้างไว้ที่ลูกบอลคำตอบ
+        </div>
+    </div>
+
+    <script>
+        // ==========================================
+        // 1. การตั้งค่าระบบและการจัดการ State
+        // ==========================================
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const videoElement = document.getElementById('webcam');
+        
+        let score = 0;
+        let num1 = 0;
+        let num2 = 0;
+        let correctAnswer = '';
+        
+        // เคอร์เซอร์นิ้วชี้
+        const cursor = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+        const targetCursor = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+        let isHandDetected = false;
+        
+        // สถานะการเลือก (Hover)
+        let hoveredBall = null;
+        let hoverProgress = 0;
+        const HOVER_MAX = 40; // จำนวนเฟรมที่ต้องค้างไว้เพื่อเลือกคำตอบ (ประมาณ 0.6 วินาที)
+
+        let balls = [];
+
+        // ปรับขนาด Canvas ให้เต็มจอ
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // ==========================================
+        // 2. ระบบ Web Audio API
+        // ==========================================
+        let audioCtx;
+        function initAudio() {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            audioCtx = new AudioContext();
+        }
+
+        function playSound(freq, type, duration) {
+            if (!audioCtx) return;
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            osc.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            osc.start();
+            gainNode.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + duration);
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        function playCorrectSound() {
+            playSound(600, 'sine', 0.1);
+            setTimeout(() => playSound(800, 'sine', 0.2), 100);
+        }
+
+        function playWrongSound() {
+            playSound(300, 'sawtooth', 0.3);
+        }
+
+        function playHoverSound() {
+            playSound(1000, 'sine', 0.05);
+        }
+
+        // ==========================================
+        // 3. ระบบเกม: ลูกบอลเด้ง และการสร้างโจทย์
+        // ==========================================
+        class Ball {
+            constructor(color, symbol) {
+                this.r = window.innerWidth > 768 ? 60 : 45; // ขนาดลูกบอล
+                // สุ่มตำแหน่งเริ่มต้นไม่ให้ติดขอบ
+                this.x = Math.random() * (canvas.width - 2 * this.r) + this.r;
+                this.y = Math.random() * (canvas.height - 2 * this.r) + this.r;
+                // ความเร็วและการเด้ง
+                this.dx = (Math.random() - 0.5) * 6;
+                this.dy = (Math.random() - 0.5) * 6;
+                this.color = color;
+                this.symbol = symbol;
+            }
+
+            update() {
+                this.x += this.dx;
+                this.y += this.dy;
+
+                // เด้งขอบซ้ายขวา
+                if (this.x - this.r < 0) { this.x = this.r; this.dx *= -1; }
+                if (this.x + this.r > canvas.width) { this.x = canvas.width - this.r; this.dx *= -1; }
+                
+                // เด้งขอบบนล่าง
+                if (this.y - this.r < 0) { this.y = this.r; this.dy *= -1; }
+                if (this.y + this.r > canvas.height) { this.y = canvas.height - this.r; this.dy *= -1; }
+            }
+
+            draw(ctx) {
+                // วาดเงาลูกบอล
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = this.color;
+                
+                // วาดลูกบอล
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+                ctx.fillStyle = this.color;
+                ctx.fill();
+                
+                ctx.shadowBlur = 0; // ปิดเงาสำหรับข้อความ
+
+                // วาดสัญลักษณ์ >, <, =
+                ctx.fillStyle = 'white';
+                ctx.font = `bold ${this.r}px Arial`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(this.symbol, this.x, this.y + 5);
+            }
+        }
+
+        function generateQuestion() {
+            // สุ่มเลข 2 หลัก (10 - 99)
+            num1 = Math.floor(Math.random() * 90) + 10;
+            num2 = Math.floor(Math.random() * 90) + 10;
+
+            if (num1 > num2) correctAnswer = '>';
+            else if (num1 < num2) correctAnswer = '<';
+            else correctAnswer = '=';
+
+            document.getElementById('num1').innerText = num1;
+            document.getElementById('num2').innerText = num2;
+
+            // รีเซ็ตลูกบอล 3 สี
+            balls = [
+                new Ball('#F97316', '>'), // ส้ม
+                new Ball('#22C55E', '<'), // เขียว
+                new Ball('#3B82F6', '=')  // น้ำเงิน
+            ];
+            
+            hoverProgress = 0;
+            hoveredBall = null;
+        }
+
+        function checkAnswer(selectedSymbol) {
+            if (selectedSymbol === correctAnswer) {
+                score += 10;
+                playCorrectSound();
+                // เอฟเฟกต์กระพริบสีเขียวที่ UI
+                document.getElementById('ui').style.textShadow = '0 0 20px #22C55E';
+            } else {
+                score = Math.max(0, score - 5);
+                playWrongSound();
+                // เอฟเฟกต์กระพริบสีแดง
+                document.getElementById('ui').style.textShadow = '0 0 20px #EF4444';
+            }
+            document.getElementById('scoreDisplay').innerText = score;
+            
+            setTimeout(() => {
+                document.getElementById('ui').style.textShadow = '';
+            }, 500);
+
+            generateQuestion();
+        }
+
+        // ==========================================
+        // 4. การจัดการภาพและ Game Loop (Canvas)
+        // ==========================================
+        function gameLoop() {
+            // 1. ล้าง Canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 2. วาดภาพจากกล้องเว็บแคมเป็นพื้นหลัง (กลับด้านซ้ายขวาให้เหมือนกระจก)
+            ctx.save();
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            // วาดให้เต็มหน้าจอแบบ Cover
+            const scale = Math.max(canvas.width / (videoElement.videoWidth || 640), canvas.height / (videoElement.videoHeight || 480));
+            const w = (videoElement.videoWidth || 640) * scale;
+            const h = (videoElement.videoHeight || 480) * scale;
+            const x = (canvas.width - w) / 2;
+            const y = (canvas.height - h) / 2;
+            if (videoElement.videoWidth > 0) {
+                ctx.drawImage(videoElement, x, y, w, h);
+            }
+            ctx.restore();
+
+            // เลเยอร์ลดความสว่างกล้องนิดหน่อยให้เห็น UI ชัดขึ้น
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 3. อัปเดตและวาดลูกบอล
+            balls.forEach(ball => {
+                ball.update();
+                ball.draw(ctx);
+            });
+
+            // 4. การจัดการเคอร์เซอร์นิ้วชี้
+            if (isHandDetected) {
+                // ระบบ Smoothing ทำให้เคอร์เซอร์เลื่อนสมูทไม่กระตุก
+                cursor.x += (targetCursor.x - cursor.x) * 0.2;
+                cursor.y += (targetCursor.y - cursor.y) * 0.2;
+
+                let isHoveringAny = false;
+
+                // ตรวจจับการชนกัน (Collision) ระหว่างเคอร์เซอร์กับลูกบอล
+                for (let ball of balls) {
+                    const dist = Math.hypot(cursor.x - ball.x, cursor.y - ball.y);
+                    if (dist < ball.r + 15) { // รัศมีวงกลมนิ้วคือ 15
+                        isHoveringAny = true;
+                        
+                        if (hoveredBall !== ball) {
+                            hoveredBall = ball;
+                            hoverProgress = 0;
+                            playHoverSound();
+                        }
+                        
+                        hoverProgress++;
+                        
+                        // วาดวงแหวนโหลด
+                        ctx.beginPath();
+                        ctx.arc(cursor.x, cursor.y, 25, -Math.PI / 2, (-Math.PI / 2) + ((hoverProgress / HOVER_MAX) * Math.PI * 2));
+                        ctx.strokeStyle = 'white';
+                        ctx.lineWidth = 4;
+                        ctx.stroke();
+
+                        // เลือกคำตอบสำเร็จ
+                        if (hoverProgress >= HOVER_MAX) {
+                            checkAnswer(ball.symbol);
+                        }
+                        break;
+                    }
+                }
+
+                if (!isHoveringAny) {
+                    hoveredBall = null;
+                    hoverProgress = Math.max(0, hoverProgress - 2); // ค่อยๆ ลดหลอดโหลดลง
+                }
+
+                // วาดเคอร์เซอร์วงกลมสีน้ำเงิน
+                ctx.beginPath();
+                ctx.arc(cursor.x, cursor.y, 15, 0, Math.PI * 2);
+                ctx.fillStyle = '#3B82F6';
+                ctx.fill();
+                
+                // วาด Glow ให้เคอร์เซอร์
+                ctx.shadowBlur = 20;
+                ctx.shadowColor = '#60A5FA';
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+            } else {
+                // ถ้าไม่เจอมือ ให้มีข้อความบอกเล็กๆ
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+                ctx.font = '20px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText('กำลังค้นหามือของคุณ...', canvas.width / 2, canvas.height - 80);
+            }
+
+            // รันเฟรมถัดไป
+            requestAnimationFrame(gameLoop);
+        }
+
+        // ==========================================
+        // 5. ระบบ Hand Tracking (MediaPipe)
+        // ==========================================
+        const hands = new Hands({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }
+        });
+
+        hands.setOptions({
+            maxNumHands: 1, // ตรวจจับแค่มือเดียว
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults((results) => {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                isHandDetected = true;
+                const landmarks = results.multiHandLandmarks[0];
+                const indexFingerTip = landmarks[8]; // จุดปลายนิ้วชี้ (Index Finger Tip)
+
+                // แปลงพิกัดแบบ Normalized (0-1) ให้เป็นพิกัดหน้าจอ
+                // หมายเหตุ: ต้องกลับด้าน X (1 - x) เพราะภาพพื้นหลังเรากลับด้านเหมือนกระจก
+                targetCursor.x = (1 - indexFingerTip.x) * canvas.width;
+                targetCursor.y = indexFingerTip.y * canvas.height;
+            } else {
+                isHandDetected = false;
+                hoverProgress = 0;
+            }
+        });
+
+        // ==========================================
+        // 6. เริ่มการทำงาน (Initialization)
+        // ==========================================
+        document.getElementById('startBtn').addEventListener('click', async () => {
+            // ซ่อนหน้าเริ่มต้นและโชว์ UI เกม
+            document.getElementById('startScreen').classList.add('hidden');
+            document.getElementById('ui').classList.remove('opacity-0');
+            
+            initAudio();
+            generateQuestion();
+
+            // เริ่มเปิดกล้องดึงภาพส่งให้ MediaPipe
+            const camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({ image: videoElement });
+                },
+                width: 640,
+                height: 480
+            });
+            
+            // จัดการกรณีที่ผู้ใช้ปฏิเสธการเข้าถึงกล้องหรือเกิดข้อผิดพลาด
+            camera.start().catch(err => {
+                console.error("Camera Error: ", err);
+                alert("ไม่สามารถเปิดกล้องได้ กรุณาอนุญาตการเข้าถึงกล้องเพื่อเล่นเกม");
+                document.getElementById('startScreen').classList.remove('hidden');
+                document.getElementById('ui').classList.add('opacity-0');
+            });
+
+            // เริ่ม Game Loop ของ Canvas
+            requestAnimationFrame(gameLoop);
+        });
+
+    </script>
+</body>
+</html>
